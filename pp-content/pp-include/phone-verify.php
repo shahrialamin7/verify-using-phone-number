@@ -109,6 +109,11 @@ function pp_phone_handle_poll($data = null) {
     // Normalize phone
     $phone = pp_phone_normalize($phone);
 
+    // L3: Validate phone format (same as verify handler)
+    if (!preg_match('/^01[3-9]\d{8}$/', $phone)) {
+        return pp_phone_safe_json(['status' => 'false', 'message' => 'Invalid number format.']);
+    }
+
     // Fetch transaction
     $params = [':ref' => $transaction_id, ':status' => 'initiated'];
     $response_txn = json_decode(getData($db_prefix.'transaction', 'WHERE ref = :ref AND status = :status', '* FROM', $params), true);
@@ -118,6 +123,11 @@ function pp_phone_handle_poll($data = null) {
     }
 
     $transaction = $response_txn['response'][0];
+
+    // H4: Verify gateway belongs to this transaction
+    if (!empty($transaction['gateway_id']) && $transaction['gateway_id'] != $gateway_id) {
+        return pp_phone_safe_json(['status' => 'false', 'message' => 'Gateway mismatch.']);
+    }
 
     // Fetch brand
     $params = [':brand_id' => $transaction['brand_id']];
@@ -379,6 +389,15 @@ function pp_phone_handle_verify($data = null) {
 
     $transaction = $response_txn['response'][0];
 
+    // H4: Verify gateway belongs to this transaction
+    if (!empty($transaction['gateway_id']) && $transaction['gateway_id'] != $gateway_id) {
+        return pp_phone_safe_json([
+            'status'  => 'false',
+            'title'   => 'Gateway Mismatch',
+            'message' => 'This payment method does not belong to this transaction.'
+        ]);
+    }
+
     // C3: Server-side timeout check — 8 minutes max
     $elapsed = (time() - strtotime($transaction['created_date'])) / 60;
     if ($elapsed > 8) {
@@ -510,9 +529,9 @@ function pp_phone_handle_verify($data = null) {
 
     // MODE 2: Transaction ID (legacy fallback)
     if (!$verified && $verify_mode === 'trxid' && !empty($trxid)) {
-        // Check duplicate trx_id
-        $checkStmt = $pdo->prepare('SELECT id FROM '.$db_prefix.'transaction WHERE trx_id = :trx_id LIMIT 1');
-        $checkStmt->execute([':trx_id' => $trxid]);
+        // Check duplicate trx_id (L4: brand-scoped)
+        $checkStmt = $pdo->prepare('SELECT id FROM '.$db_prefix.'transaction WHERE trx_id = :trx_id AND brand_id = :brand_id LIMIT 1');
+        $checkStmt->execute([':trx_id' => $trxid, ':brand_id' => $transaction['brand_id']]);
         if ($checkStmt->fetch()) {
             return pp_phone_safe_json([
                 'status'  => 'false',
@@ -536,9 +555,11 @@ function pp_phone_handle_verify($data = null) {
                 $verified = true;
                 $match_method = 'trxid';
             } else {
-                // Revert claim
-                $revertStmt = $pdo->prepare('UPDATE '.$db_prefix.'sms_data SET status = :approved WHERE id = :sms_id AND status = :used');
-                $revertStmt->execute([':approved' => 'approved', ':sms_id' => $matched_sms['id']]);
+                // Revert claim (null check for edge case)
+                if ($matched_sms) {
+                    $revertStmt = $pdo->prepare('UPDATE '.$db_prefix.'sms_data SET status = :approved WHERE id = :sms_id AND status = :used');
+                    $revertStmt->execute([':approved' => 'approved', ':sms_id' => $matched_sms['id']]);
+                }
                 $matched_sms = null;
             }
         }
