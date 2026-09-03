@@ -77,6 +77,22 @@ function pp_slug_to_sender_key($slug) {
 }
 
 /**
+ * Set transaction status to expired via direct DB update
+ * Used by server-side timeout enforcement
+ */
+function pp_phone_set_expired($transaction_id) {
+    global $db_prefix;
+    $pdo = connectDatabase();
+    $stmt = $pdo->prepare('UPDATE '.$db_prefix.'transaction SET status = :expired, updated_date = :now WHERE ref = :ref AND status = :initiated');
+    $stmt->execute([
+        ':expired'  => 'expired',
+        ':now'      => getCurrentDatetime('Y-m-d H:i:s'),
+        ':ref'      => $transaction_id,
+        ':initiated' => 'initiated',
+    ]);
+}
+
+/**
  * Handle polling — check if SMS matches phone + amount
  */
 function pp_phone_handle_poll($data = null) {
@@ -84,11 +100,7 @@ function pp_phone_handle_poll($data = null) {
 
     $gateway_id     = escape_string($_POST['gateway_id'] ?? '');
     $transaction_id = escape_string($_POST['transaction_id'] ?? '');
-    $provider       = escape_string($_POST['provider'] ?? '');
     $phone          = escape_string($_POST['mobile_number'] ?? '');
-
-    // Derive sms_data sender_key from gateway slug
-    $sender_key = pp_slug_to_sender_key($provider);
 
     if (empty($gateway_id) || empty($transaction_id) || empty($phone)) {
         return pp_phone_safe_json(['status' => 'false', 'message' => 'Missing parameters.']);
@@ -126,6 +138,20 @@ function pp_phone_handle_poll($data = null) {
     }
 
     $gateway = $response_gw['response'][0];
+
+    // C1: Derive sender_key from gateway slug (server-side, not client)
+    $sender_key = pp_slug_to_sender_key($gateway['slug']);
+
+    // C3: Server-side timeout check — 8 minutes max
+    $elapsed = (time() - strtotime($transaction['created_date'])) / 60;
+    if ($elapsed > 8) {
+        pp_phone_set_expired($transaction_id);
+        return pp_phone_safe_json([
+            'status'  => 'false',
+            'title'   => 'Session Expired',
+            'message' => 'Payment verification window has expired.',
+        ]);
+    }
 
     // Calculate payable amount (same logic as adapter)
     $currencyRates = [];
@@ -293,7 +319,17 @@ function pp_phone_handle_cancel($data = null) {
         return pp_phone_safe_json(['status' => 'false', 'message' => 'Missing parameters.']);
     }
 
-    pp_set_transaction_status($transaction_id, 'expired');
+    // C4: Validate transaction exists AND status is initiated
+    $params = [':ref' => $transaction_id, ':status' => 'initiated'];
+    $response = json_decode(getData($db_prefix.'transaction', 
+        'WHERE ref = :ref AND status = :status', '* FROM', $params), true);
+    
+    if ($response['status'] !== true) {
+        // Already processed or doesn't exist — no-op
+        return pp_phone_safe_json(['status' => 'true']);
+    }
+
+    pp_phone_set_expired($transaction_id);
     return pp_phone_safe_json(['status' => 'true']);
 }
 
@@ -305,13 +341,9 @@ function pp_phone_handle_verify($data = null) {
 
     $gateway_id     = escape_string($_POST['gateway_id'] ?? '');
     $transaction_id = escape_string($_POST['transaction_id'] ?? '');
-    $provider       = escape_string($_POST['provider'] ?? '');
     $phone          = escape_string($_POST['mobile_number'] ?? '');
     $trxid          = escape_string($_POST['trxid'] ?? '');
     $verify_mode    = escape_string($_POST['verify_mode'] ?? 'auto'); // auto | phone | trxid
-
-    // Derive sms_data sender_key from gateway slug
-    $sender_key = pp_slug_to_sender_key($provider);
 
     // Normalize phone
     if (!empty($phone)) {
@@ -347,6 +379,17 @@ function pp_phone_handle_verify($data = null) {
 
     $transaction = $response_txn['response'][0];
 
+    // C3: Server-side timeout check — 8 minutes max
+    $elapsed = (time() - strtotime($transaction['created_date'])) / 60;
+    if ($elapsed > 8) {
+        pp_phone_set_expired($transaction_id);
+        return pp_phone_safe_json([
+            'status'  => 'false',
+            'title'   => 'Session Expired',
+            'message' => 'Payment verification window has expired.',
+        ]);
+    }
+
     // Fetch brand
     $params = [':brand_id' => $transaction['brand_id']];
     $response_brand = json_decode(getData($db_prefix.'brands', 'WHERE brand_id = :brand_id', '* FROM', $params), true);
@@ -374,6 +417,20 @@ function pp_phone_handle_verify($data = null) {
     }
 
     $gateway = $response_gw['response'][0];
+
+    // C1: Derive sender_key from gateway slug (server-side, not client)
+    $sender_key = pp_slug_to_sender_key($gateway['slug']);
+
+    // C3: Server-side timeout check — 8 minutes max
+    $elapsed = (time() - strtotime($transaction['created_date'])) / 60;
+    if ($elapsed > 8) {
+        pp_phone_set_expired($transaction_id);
+        return pp_phone_safe_json([
+            'status'  => 'false',
+            'title'   => 'Session Expired',
+            'message' => 'Payment verification window has expired.',
+        ]);
+    }
 
     // Calculate payable amount
     $currencyRates = [];
