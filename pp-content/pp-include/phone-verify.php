@@ -93,6 +93,73 @@ function pp_phone_set_expired($transaction_id) {
 }
 
 /**
+ * H1: Generate CSRF token for phone verification
+ */
+function pp_phone_csrf_token() {
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+    if (empty($_SESSION['pp_phone_csrf'])) {
+        $_SESSION['pp_phone_csrf'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['pp_phone_csrf'];
+}
+
+/**
+ * H1: Validate CSRF token
+ */
+function pp_phone_csrf_validate($token) {
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+    if (empty($_SESSION['pp_phone_csrf']) || empty($token)) {
+        return false;
+    }
+    return hash_equals($_SESSION['pp_phone_csrf'], $token);
+}
+
+/**
+ * H1: Rotate CSRF token (call after successful action)
+ */
+function pp_phone_csrf_rotate() {
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+    $_SESSION['pp_phone_csrf'] = bin2hex(random_bytes(32));
+    return $_SESSION['pp_phone_csrf'];
+}
+
+/**
+ * F4: Store transaction in session for ownership tracking
+ */
+function pp_phone_session_track($transaction_id) {
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+    $_SESSION['pp_phone_txn'] = $transaction_id;
+}
+
+/**
+ * F4: Validate transaction session ownership
+ */
+function pp_phone_session_validate($transaction_id) {
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+    return isset($_SESSION['pp_phone_txn']) && $_SESSION['pp_phone_txn'] === $transaction_id;
+}
+
+/**
+ * F4: Clear transaction session
+ */
+function pp_phone_session_clear() {
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+    unset($_SESSION['pp_phone_txn']);
+}
+
+/**
  * Calculate payable amount from transaction + gateway config
  * Returns formatted amount string
  */
@@ -173,21 +240,35 @@ function pp_phone_send_webhook($transaction, $gateway, $brand, $sms, $sender_key
         ),
     ];
 
-    $jobs = [[
-        'id'      => bin2hex(random_bytes(16)),
-        'url'     => $transaction['webhook_url'],
-        'payload' => $ipnData,
-    ]];
+    // F3: Webhook retry with exponential backoff (3 attempts: 0s, 2s, 4s)
+    $max_attempts = 3;
+    $success = false;
 
-    $results = sendIPNMulti($jobs);
-
-    foreach ($jobs as $job) {
-        $code = $results[$job['id']] ?? 0;
-        if ($code !== 200) {
-            $columns = ['ref', 'brand_id', 'payload', 'url', 'created_date', 'updated_date'];
-            $values = [bin2hex(random_bytes(16)), $brand['brand_id'], json_encode($ipnData, JSON_UNESCAPED_UNICODE), $transaction['webhook_url'], getCurrentDatetime('Y-m-d H:i:s'), getCurrentDatetime('Y-m-d H:i:s')];
-            insertData($db_prefix.'webhook_log', $columns, $values);
+    for ($attempt = 0; $attempt < $max_attempts; $attempt++) {
+        if ($attempt > 0) {
+            sleep(pow(2, $attempt)); // 2s, 4s
         }
+
+        $job_id = bin2hex(random_bytes(16));
+        $jobs = [[
+            'id'      => $job_id,
+            'url'     => $transaction['webhook_url'],
+            'payload' => $ipnData,
+        ]];
+
+        $results = sendIPNMulti($jobs);
+        $code = $results[$job_id] ?? 0;
+
+        if ($code === 200) {
+            $success = true;
+            break;
+        }
+    }
+
+    if (!$success) {
+        $columns = ['ref', 'brand_id', 'payload', 'url', 'created_date', 'updated_date'];
+        $values = [bin2hex(random_bytes(16)), $brand['brand_id'], json_encode($ipnData, JSON_UNESCAPED_UNICODE), $transaction['webhook_url'], getCurrentDatetime('Y-m-d H:i:s'), getCurrentDatetime('Y-m-d H:i:s')];
+        insertData($db_prefix.'webhook_log', $columns, $values);
     }
 }
 
@@ -197,12 +278,23 @@ function pp_phone_send_webhook($transaction, $gateway, $brand, $sms, $sender_key
 function pp_phone_handle_poll($data = null) {
     global $db_prefix;
 
+    // H1: CSRF validation
+    $csrf_token = escape_string($_POST['csrf_token'] ?? '');
+    if (!pp_phone_csrf_validate($csrf_token)) {
+        return pp_phone_safe_json(['status' => 'false', 'message' => 'Invalid request.']);
+    }
+
     $gateway_id     = escape_string($_POST['gateway_id'] ?? '');
     $transaction_id = escape_string($_POST['transaction_id'] ?? '');
     $phone          = escape_string($_POST['mobile_number'] ?? '');
 
     if (empty($gateway_id) || empty($transaction_id) || empty($phone)) {
         return pp_phone_safe_json(['status' => 'false', 'message' => 'Missing parameters.']);
+    }
+
+    // F4: Validate session ownership
+    if (!pp_phone_session_validate($transaction_id)) {
+        return pp_phone_safe_json(['status' => 'false', 'message' => 'Session mismatch.']);
     }
 
     // Normalize phone
@@ -267,19 +359,26 @@ function pp_phone_handle_poll($data = null) {
 
     $pdo = connectDatabase();
 
+    // H3: sms_data_validity — fetch from brand settings, default 30 min
+    $validity_minutes = intval($brand['sms_data_validity'] ?? 0);
+    if ($validity_minutes < 1) $validity_minutes = 30; // fallback default
+
     // Search sms_data: provider + phone + exact amount + approved
+    // H3: Add time window filter
     $findSql = 'SELECT id, trx_id, number, amount, sender, type 
                 FROM '.$db_prefix.'sms_data 
                 WHERE sender_key = :sender_key 
                   AND amount = :amount 
                   AND status = :status 
+                  AND created_date > DATE_SUB(NOW(), INTERVAL :validity MINUTE)
                 ORDER BY id DESC 
                 LIMIT 10';
     $findStmt = $pdo->prepare($findSql);
     $findStmt->execute([
         ':sender_key' => $sender_key,
         ':amount'    => $payableAmount,
-        ':status'    => 'approved'
+        ':status'    => 'approved',
+        ':validity'  => $validity_minutes
     ]);
     $candidates = $findStmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -344,6 +443,15 @@ function pp_phone_handle_cancel($data = null) {
     $transaction_id = escape_string($_POST['transaction_id'] ?? '');
     $gateway_id    = escape_string($_POST['gateway_id'] ?? '');
 
+    // H1: CSRF validation
+    if (!pp_phone_csrf_validate($_POST['csrf_token'] ?? '')) {
+        return pp_phone_safe_json([
+            'status'  => 'false',
+            'title'   => 'Security Error',
+            'message' => 'Invalid security token. Please refresh and try again.'
+        ]);
+    }
+
     if (empty($transaction_id) || empty($gateway_id)) {
         return pp_phone_safe_json(['status' => 'false', 'message' => 'Missing parameters.']);
     }
@@ -373,6 +481,15 @@ function pp_phone_handle_verify($data = null) {
     $phone          = escape_string($_POST['mobile_number'] ?? '');
     $trxid          = escape_string($_POST['trxid'] ?? '');
     $verify_mode    = escape_string($_POST['verify_mode'] ?? 'auto'); // auto | phone | trxid
+
+    // H1: CSRF validation
+    if (!pp_phone_csrf_validate($_POST['csrf_token'] ?? '')) {
+        return pp_phone_safe_json([
+            'status'  => 'false',
+            'title'   => 'Security Error',
+            'message' => 'Invalid security token. Please refresh and try again.'
+        ]);
+    }
 
     // Normalize phone
     if (!empty($phone)) {
@@ -511,14 +628,19 @@ function pp_phone_handle_verify($data = null) {
 
     // MODE 1: Phone + amount with tolerance (fallback)
     if (!$verified && ($verify_mode === 'auto' || $verify_mode === 'phone') && !empty($phone)) {
+        // H3: sms_data_validity — default 30 min
+        $validity_minutes = intval($brand['sms_data_validity'] ?? 0);
+        if ($validity_minutes < 1) $validity_minutes = 30;
+
         $findSql = 'SELECT id, trx_id, number, amount, sender, type 
                     FROM '.$db_prefix.'sms_data 
                     WHERE sender_key = :sender_key 
                       AND status = :approved 
+                      AND created_date > DATE_SUB(NOW(), INTERVAL :validity MINUTE)
                     ORDER BY id DESC 
                     LIMIT 20';
         $findStmt = $pdo->prepare($findSql);
-        $findStmt->execute([':sender_key' => $sender_key, ':approved' => 'approved']);
+        $findStmt->execute([':sender_key' => $sender_key, ':approved' => 'approved', ':validity' => $validity_minutes]);
         $candidates = $findStmt->fetchAll(PDO::FETCH_ASSOC);
 
         foreach ($candidates as $sms) {
@@ -701,6 +823,7 @@ function pp_phone_render_form($data) {
         var errSvg=\'<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#e53e3e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M12 12m-9 0a9 9 0 1 0 18 0a9 9 0 1 0 -18 0"/><path d="M12 9v4"/><path d="M12 16v.01"/></svg>\';
         var pollTimer=null, countdownTimer=null, remaining=480;
         var gatewayId="'.$gateway_id.'", txnRef="'.$txn_ref.'";
+        var csrfToken="'.htmlspecialchars(pp_phone_csrf_token()).'";
         var sessionKey="pp_phone_"+txnRef;
         var timeKey="pp_phone_time_"+txnRef;
         var fallbackKey="pp_phone_fb_"+txnRef;
@@ -787,6 +910,7 @@ function pp_phone_render_form($data) {
                 var fd=new FormData();fd.append("action-v2","pp-phone-verify");
                 fd.append("gateway_id",gatewayId);fd.append("transaction_id",txnRef);
                 fd.append("trxid",trxid);fd.append("verify_mode","trxid");
+                fd.append("csrf_token",csrfToken);
                 this.innerHTML="Verifying...";
                 var self=this;
                 fetch("",{method:"POST",body:fd}).then(function(r){return r.json();}).then(function(d){
@@ -846,6 +970,7 @@ function pp_phone_render_form($data) {
                 var fd=new FormData();fd.append("action-v2","pp-phone-poll");
                 fd.append("gateway_id",gatewayId);fd.append("transaction_id",txnRef);
                 fd.append("mobile_number",phone);
+                fd.append("csrf_token",csrfToken);
                 fetch("",{method:"POST",body:fd}).then(function(r){return r.json();}).then(function(d){
                     if(d.status==="true"){clearInterval(pollTimer);clearInterval(countdownTimer);
                     try{sessionStorage.removeItem(sessionKey);sessionStorage.removeItem(timeKey);sessionStorage.removeItem(fallbackKey);}catch(e){}
@@ -873,6 +998,7 @@ function pp_phone_render_form($data) {
                 try{sessionStorage.removeItem(sessionKey);sessionStorage.removeItem(timeKey);sessionStorage.removeItem(fallbackKey);}catch(e){}
                 var fd=new FormData();fd.append("action-v2","pp-phone-cancel");
                 fd.append("transaction_id",txnRef);fd.append("gateway_id",gatewayId);
+                fd.append("csrf_token",csrfToken);
                 fetch("",{method:"POST",body:fd});
                 window.location.href=window.location.pathname+"?gateway="+gatewayId;
                 return;
@@ -891,6 +1017,7 @@ function pp_phone_render_form($data) {
                     try{sessionStorage.removeItem(sessionKey);sessionStorage.removeItem(timeKey);sessionStorage.removeItem(fallbackKey);}catch(e){}
                     var fd=new FormData();fd.append("action-v2","pp-phone-cancel");
                     fd.append("transaction_id",txnRef);fd.append("gateway_id",gatewayId);
+                    fd.append("csrf_token",csrfToken);
                     fetch("",{method:"POST",body:fd});
                     window.location.href=window.location.pathname+"?gateway="+gatewayId;
                 }
