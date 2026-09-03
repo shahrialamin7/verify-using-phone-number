@@ -359,26 +359,19 @@ function pp_phone_handle_poll($data = null) {
 
     $pdo = connectDatabase();
 
-    // H3: sms_data_validity — fetch from brand settings, default 30 min
-    $validity_minutes = intval($brand['sms_data_validity'] ?? 0);
-    if ($validity_minutes < 1) $validity_minutes = 30; // fallback default
-
     // Search sms_data: provider + phone + exact amount + approved
-    // H3: Add time window filter
     $findSql = 'SELECT id, trx_id, number, amount, sender, type 
                 FROM '.$db_prefix.'sms_data 
                 WHERE sender_key = :sender_key 
                   AND amount = :amount 
                   AND status = :status 
-                  AND created_date > DATE_SUB(NOW(), INTERVAL :validity MINUTE)
                 ORDER BY id DESC 
                 LIMIT 10';
     $findStmt = $pdo->prepare($findSql);
     $findStmt->execute([
         ':sender_key' => $sender_key,
         ':amount'    => $payableAmount,
-        ':status'    => 'approved',
-        ':validity'  => $validity_minutes
+        ':status'    => 'approved'
     ]);
     $candidates = $findStmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -628,19 +621,14 @@ function pp_phone_handle_verify($data = null) {
 
     // MODE 1: Phone + amount with tolerance (fallback)
     if (!$verified && ($verify_mode === 'auto' || $verify_mode === 'phone') && !empty($phone)) {
-        // H3: sms_data_validity — default 30 min
-        $validity_minutes = intval($brand['sms_data_validity'] ?? 0);
-        if ($validity_minutes < 1) $validity_minutes = 30;
-
         $findSql = 'SELECT id, trx_id, number, amount, sender, type 
                     FROM '.$db_prefix.'sms_data 
                     WHERE sender_key = :sender_key 
                       AND status = :approved 
-                      AND created_date > DATE_SUB(NOW(), INTERVAL :validity MINUTE)
                     ORDER BY id DESC 
                     LIMIT 20';
         $findStmt = $pdo->prepare($findSql);
-        $findStmt->execute([':sender_key' => $sender_key, ':approved' => 'approved', ':validity' => $validity_minutes]);
+        $findStmt->execute([':sender_key' => $sender_key, ':approved' => 'approved']);
         $candidates = $findStmt->fetchAll(PDO::FETCH_ASSOC);
 
         foreach ($candidates as $sms) {
