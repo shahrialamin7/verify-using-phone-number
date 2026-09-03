@@ -93,6 +93,105 @@ function pp_phone_set_expired($transaction_id) {
 }
 
 /**
+ * Calculate payable amount from transaction + gateway config
+ * Returns formatted amount string
+ */
+function pp_phone_calculate_payable($transaction, $gateway, $brand) {
+    global $db_prefix;
+    $currencyRates = [];
+    $currencyRes = json_decode(getData($db_prefix.'currency', 'WHERE brand_id = :brand_id', '* FROM', [':brand_id' => $brand['brand_id']]), true);
+    if (!empty($currencyRes['response'])) {
+        foreach ($currencyRes['response'] as $c) {
+            $currencyRates[$c['code']] = $c['rate'];
+        }
+    }
+
+    $txnAmount    = money_sanitize($transaction['amount']);
+    $txnCurrency  = $transaction['currency'];
+    $gwCurrency   = $gateway['currency'];
+
+    if ($txnCurrency === $gwCurrency) {
+        $convertedAmount = $txnAmount;
+    } else {
+        $convertedAmount = isset($currencyRates[$gwCurrency])
+            ? money_div($txnAmount, $currencyRates[$gwCurrency])
+            : "0";
+    }
+
+    $fixed_discount     = money_sanitize($gateway['fixed_discount']);
+    $percentage_discount = money_sanitize($gateway['percentage_discount']);
+    $fixed_charge       = money_sanitize($gateway['fixed_charge']);
+    $percentage_charge  = money_sanitize($gateway['percentage_charge']);
+
+    $pctDiscAmt = money_div(money_mul($convertedAmount, $percentage_discount, 8), "100", 8);
+    $totalDiscount = money_add($fixed_discount, $pctDiscAmt, 8);
+
+    $pctChgAmt = money_div(money_mul($convertedAmount, $percentage_charge, 8), "100", 8);
+    $totalProcessingFee = money_add($fixed_charge, $pctChgAmt, 8);
+
+    $convertedAmount = money_add(money_sub($convertedAmount, $totalDiscount, 8), $totalProcessingFee, 8);
+
+    return number_format((float)$convertedAmount, 2, '.', '');
+}
+
+/**
+ * Send webhook for completed transaction
+ */
+function pp_phone_send_webhook($transaction, $gateway, $brand, $sms, $sender_key) {
+    global $db_prefix;
+
+    if (empty($transaction['webhook_url']) || $transaction['webhook_url'] === '--') {
+        return;
+    }
+
+    $customer_info = json_decode($transaction['customer_info'], true) ?: [];
+    $metadata = json_decode($transaction['metadata'], true) ?: [];
+
+    $ipnData = [
+        'pp_id'           => $transaction['ref'],
+        'full_name'       => $customer_info['name'] ?? 'N/A',
+        'email_address'   => $customer_info['email'] ?? 'N/A',
+        'mobile_number'   => $customer_info['mobile'] ?? 'N/A',
+        'gateway'         => $gateway['name'] ?? 'Phone Verify',
+        'amount'          => money_round($transaction['amount']),
+        'fee'             => money_round($transaction['processing_fee']),
+        'discount_amount' => money_round($transaction['discount_amount']),
+        'total'           => money_sub(money_add($transaction['amount'], $transaction['processing_fee']), $transaction['discount_amount']),
+        'local_net_amount'=> money_round($transaction['local_net_amount']),
+        'currency'        => $transaction['currency'],
+        'local_currency'  => $transaction['local_currency'],
+        'metadata'        => $metadata,
+        'sender'          => $sms['number'],
+        'sender_key'      => $sender_key,
+        'sender_type'     => $sms['type'],
+        'transaction_id'  => $sms['trx_id'],
+        'status'          => 'completed',
+        'date'            => convertUTCtoUserTZ(
+            $transaction['created_date'],
+            ($brand['timezone'] === '--' || $brand['timezone'] === '') ? 'Asia/Dhaka' : $brand['timezone'],
+            "M d, Y h:i A"
+        ),
+    ];
+
+    $jobs = [[
+        'id'      => bin2hex(random_bytes(16)),
+        'url'     => $transaction['webhook_url'],
+        'payload' => $ipnData,
+    ]];
+
+    $results = sendIPNMulti($jobs);
+
+    foreach ($jobs as $job) {
+        $code = $results[$job['id']] ?? 0;
+        if ($code !== 200) {
+            $columns = ['ref', 'brand_id', 'payload', 'url', 'created_date', 'updated_date'];
+            $values = [bin2hex(random_bytes(16)), $brand['brand_id'], json_encode($ipnData, JSON_UNESCAPED_UNICODE), $transaction['webhook_url'], getCurrentDatetime('Y-m-d H:i:s'), getCurrentDatetime('Y-m-d H:i:s')];
+            insertData($db_prefix.'webhook_log', $columns, $values);
+        }
+    }
+}
+
+/**
  * Handle polling — check if SMS matches phone + amount
  */
 function pp_phone_handle_poll($data = null) {
@@ -163,42 +262,8 @@ function pp_phone_handle_poll($data = null) {
         ]);
     }
 
-    // Calculate payable amount (same logic as adapter)
-    $currencyRates = [];
-    $currencyRes = json_decode(getData($db_prefix.'currency', 'WHERE brand_id = :brand_id', '* FROM', [':brand_id' => $brand['brand_id']]), true);
-    if (!empty($currencyRes['response'])) {
-        foreach ($currencyRes['response'] as $c) {
-            $currencyRates[$c['code']] = $c['rate'];
-        }
-    }
-
-    $txnAmount    = money_sanitize($transaction['amount']);
-    $txnCurrency  = $transaction['currency'];
-    $gwCurrency   = $gateway['currency'];
-
-    if ($txnCurrency === $gwCurrency) {
-        $convertedAmount = $txnAmount;
-    } else {
-        $convertedAmount = isset($currencyRates[$gwCurrency])
-            ? money_div($txnAmount, $currencyRates[$gwCurrency])
-            : "0";
-    }
-
-    $fixed_discount     = money_sanitize($gateway['fixed_discount']);
-    $percentage_discount = money_sanitize($gateway['percentage_discount']);
-    $fixed_charge       = money_sanitize($gateway['fixed_charge']);
-    $percentage_charge  = money_sanitize($gateway['percentage_charge']);
-
-    $pctDiscAmt = money_div(money_mul($convertedAmount, $percentage_discount, 8), "100", 8);
-    $totalDiscount = money_add($fixed_discount, $pctDiscAmt, 8);
-
-    $pctChgAmt = money_div(money_mul($convertedAmount, $percentage_charge, 8), "100", 8);
-    $totalProcessingFee = money_add($fixed_charge, $pctChgAmt, 8);
-
-    $convertedAmount = money_add(money_sub($convertedAmount, $totalDiscount, 8), $totalProcessingFee, 8);
-
-    // Get exact amount for polling match
-    $payableAmount = number_format((float)$convertedAmount, 2, '.', '');
+    // Calculate payable amount
+    $payableAmount = pp_phone_calculate_payable($transaction, $gateway, $brand);
 
     $pdo = connectDatabase();
 
@@ -252,53 +317,7 @@ function pp_phone_handle_poll($data = null) {
             );
 
             // Webhook
-            if (!empty($transaction['webhook_url']) && $transaction['webhook_url'] !== '--') {
-                $customer_info = json_decode($transaction['customer_info'], true) ?: [];
-                $metadata = json_decode($transaction['metadata'], true) ?: [];
-
-                $ipnData = [
-                    'pp_id'           => $transaction['ref'],
-                    'full_name'       => $customer_info['name'] ?? 'N/A',
-                    'email_address'   => $customer_info['email'] ?? 'N/A',
-                    'mobile_number'   => $customer_info['mobile'] ?? 'N/A',
-                    'gateway'         => $gateway['name'] ?? 'Phone Verify',
-                    'amount'          => money_round($transaction['amount']),
-                    'fee'             => money_round($transaction['processing_fee']),
-                    'discount_amount' => money_round($transaction['discount_amount']),
-                    'total'           => money_sub(money_add($transaction['amount'], $transaction['processing_fee']), $transaction['discount_amount']),
-                    'local_net_amount'=> money_round($transaction['local_net_amount']),
-                    'currency'        => $transaction['currency'],
-                    'local_currency'  => $transaction['local_currency'],
-                    'metadata'        => $metadata,
-                    'sender'          => $sms['number'],
-                    'sender_key'      => $sender_key,
-                    'sender_type'     => $sms['type'],
-                    'transaction_id'  => $sms['trx_id'],
-                    'status'          => 'completed',
-                    'date'            => convertUTCtoUserTZ(
-                        $transaction['created_date'],
-                        ($brand['timezone'] === '--' || $brand['timezone'] === '') ? 'Asia/Dhaka' : $brand['timezone'],
-                        "M d, Y h:i A"
-                    ),
-                ];
-
-                $jobs = [[
-                    'id'      => rand(),
-                    'url'     => $transaction['webhook_url'],
-                    'payload' => $ipnData,
-                ]];
-
-                $results = sendIPNMulti($jobs);
-
-                foreach ($jobs as $job) {
-                    $code = $results[$job['id']] ?? 0;
-                    if ($code !== 200) {
-                        $columns = ['ref', 'brand_id', 'payload', 'url', 'created_date', 'updated_date'];
-                        $values = [rand(), $brand['brand_id'], json_encode($ipnData, JSON_UNESCAPED_UNICODE), $transaction['webhook_url'], getCurrentDatetime('Y-m-d H:i:s'), getCurrentDatetime('Y-m-d H:i:s')];
-                        insertData($db_prefix.'webhook_log', $columns, $values);
-                    }
-                }
-            }
+            pp_phone_send_webhook($transaction, $gateway, $brand, $sms, $sender_key);
 
             return pp_phone_safe_json([
                 'status'   => 'true',
@@ -587,53 +606,7 @@ function pp_phone_handle_verify($data = null) {
         );
 
         // Webhook
-        if (!empty($transaction['webhook_url']) && $transaction['webhook_url'] !== '--') {
-            $customer_info = json_decode($transaction['customer_info'], true) ?: [];
-            $metadata = json_decode($transaction['metadata'], true) ?: [];
-
-            $ipnData = [
-                'pp_id'           => $transaction['ref'],
-                'full_name'       => $customer_info['name'] ?? 'N/A',
-                'email_address'   => $customer_info['email'] ?? 'N/A',
-                'mobile_number'   => $customer_info['mobile'] ?? 'N/A',
-                'gateway'         => $gateway['name'] ?? 'Phone Verify',
-                'amount'          => money_round($transaction['amount']),
-                'fee'             => money_round($transaction['processing_fee']),
-                'discount_amount' => money_round($transaction['discount_amount']),
-                'total'           => money_sub(money_add($transaction['amount'], $transaction['processing_fee']), $transaction['discount_amount']),
-                'local_net_amount'=> money_round($transaction['local_net_amount']),
-                'currency'        => $transaction['currency'],
-                'local_currency'  => $transaction['local_currency'],
-                'metadata'        => $metadata,
-                'sender'          => $matched_sms['number'],
-                'sender_key'      => $sender_key,
-                'sender_type'     => $matched_sms['type'],
-                'transaction_id'  => $matched_sms['trx_id'],
-                'status'          => 'completed',
-                'date'            => convertUTCtoUserTZ(
-                    $transaction['created_date'],
-                    ($brand['timezone'] === '--' || $brand['timezone'] === '') ? 'Asia/Dhaka' : $brand['timezone'],
-                    "M d, Y h:i A"
-                ),
-            ];
-
-            $jobs = [[
-                'id'      => rand(),
-                'url'     => $transaction['webhook_url'],
-                'payload' => $ipnData,
-            ]];
-
-            $results = sendIPNMulti($jobs);
-
-            foreach ($jobs as $job) {
-                $code = $results[$job['id']] ?? 0;
-                if ($code !== 200) {
-                    $columns = ['ref', 'brand_id', 'payload', 'url', 'created_date', 'updated_date'];
-                    $values = [rand(), $brand['brand_id'], json_encode($ipnData, JSON_UNESCAPED_UNICODE), $transaction['webhook_url'], getCurrentDatetime('Y-m-d H:i:s'), getCurrentDatetime('Y-m-d H:i:s')];
-                    insertData($db_prefix.'webhook_log', $columns, $values);
-                }
-            }
-        }
+        pp_phone_send_webhook($transaction, $gateway, $brand, $matched_sms, $sender_key);
 
         return pp_phone_safe_json([
             'status'   => 'true',
@@ -658,27 +631,23 @@ function pp_phone_handle_verify($data = null) {
 function pp_phone_render_form($data) {
     $gateway_id  = htmlspecialchars($data['gateway']['gateway_id'] ?? '');
     $txn_ref     = htmlspecialchars($data['transaction']['ref'] ?? '');
-    $provider    = htmlspecialchars($data['gateway']['slug'] ?? '');
     $amount      = htmlspecialchars($data['transaction']['local_net_amount'] ?? '0');
     $currency    = htmlspecialchars($data['transaction']['local_currency'] ?? '');
     $payable     = htmlspecialchars(number_format((float)($data['transaction']['amount'] ?? 0), 2));
     $discount    = htmlspecialchars($data['transaction']['discount_amount'] ?? '0');
     $fee         = htmlspecialchars($data['transaction']['processing_fee'] ?? '0');
-    $receipt_id  = htmlspecialchars($data['transaction']['ref'] ?? '');
 
     // Language strings
     $lang = $data['lang'] ?? [];
     $lbl_phone       = $lang['mobile_number'] ?? 'Mobile Number';
     $lbl_next        = 'Next →';
     $lbl_verify      = $lang['verify'] ?? 'Verify';
-    $lbl_submit      = $lang['submit'] ?? 'Submit';
     $lbl_trxid       = $lang['transaction_id'] ?? 'Transaction ID';
     $lbl_enter_trxid = $lang['enter_transaction_id'] ?? 'Enter Transaction ID';
     $lbl_inst_title  = 'Payment Instructions';
     $lbl_waiting     = 'Waiting for your payment...';
     $lbl_fallback    = 'Payment not detected?';
     $lbl_use_trxid   = 'Use Transaction ID instead';
-    $lbl_remain      = 'remaining';
     $lbl_keep_window = 'Please do not close this window. We will automatically verify your payment once it\'s complete.';
 
     echo '
@@ -699,7 +668,7 @@ function pp_phone_render_form($data) {
         <div class="hz-form-body">
             <div class="form-group">
                 <label class="form-label">'.$lbl_trxid.'</label>
-                <input type="text" id="pp-phone-trxid-input" class="form-control" placeholder="'.$lbl_enter_trxid.'">
+                <input type="text" id="pp-phone-trxid-input" class="form-control" placeholder="'.htmlspecialchars($lbl_enter_trxid).'">
             </div>
             <button type="button" id="pp-phone-trxid-submit" class="btn-primary">
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
@@ -731,7 +700,7 @@ function pp_phone_render_form($data) {
     (function(){
         var errSvg=\'<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#e53e3e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M12 12m-9 0a9 9 0 1 0 18 0a9 9 0 1 0 -18 0"/><path d="M12 9v4"/><path d="M12 16v.01"/></svg>\';
         var pollTimer=null, countdownTimer=null, remaining=480;
-        var gatewayId="'.$gateway_id.'", txnRef="'.$txn_ref.'", provider="'.$provider.'";
+        var gatewayId="'.$gateway_id.'", txnRef="'.$txn_ref.'";
         var sessionKey="pp_phone_"+txnRef;
         var timeKey="pp_phone_time_"+txnRef;
         var fallbackKey="pp_phone_fb_"+txnRef;
@@ -744,6 +713,7 @@ function pp_phone_render_form($data) {
         function moveIntoInstCard(){
             if(moved) return;
             var instCard=document.getElementById("hz-inst-section");
+            if(!instCard) return;
             var content=instCard.querySelector("#hz-instructions-content")||instCard;
             var instrList=content.querySelector("ol.payment-instructions");
             if(instrList) instrList.style.display="none";
@@ -763,11 +733,13 @@ function pp_phone_render_form($data) {
             step2.style.display="none";
             step1.style.display="block";
             var instCard=document.getElementById("hz-inst-section");
-            var title=instCard.querySelector(".hz-inst-title");
-            if(title) title.style.display="none";
-            var content=instCard.querySelector("#hz-instructions-content")||instCard;
-            var instrList=content.querySelector("ol.payment-instructions");
-            if(instrList) instrList.style.display="none";
+            if(instCard){
+                var title=instCard.querySelector(".hz-inst-title");
+                if(title) title.style.display="none";
+                var content=instCard.querySelector("#hz-instructions-content")||instCard;
+                var instrList=content.querySelector("ol.payment-instructions");
+                if(instrList) instrList.style.display="none";
+            }
             var wa=document.getElementById("pp-phone-wait-area");
             if(wa)wa.remove();
             /* Hide & reset fallback form */
@@ -785,13 +757,15 @@ function pp_phone_render_form($data) {
             /* Push history so phone back button goes to step 1 instead of checkout */
             try{history.pushState({ppStep2:phone},"");}catch(e){}
             var instCard=document.getElementById("hz-inst-section");
-            var title=instCard.querySelector(".hz-inst-title");
-            if(title) title.style.display="";
-            var content=instCard.querySelector("#hz-instructions-content")||instCard;
-            var instrList=content.querySelector("ol.payment-instructions");
-            if(instrList) instrList.style.display="";
-            if(!document.getElementById("pp-phone-wait-area")){
-                content.insertAdjacentHTML("beforeend",'.$waitAreaJs.');
+            if(instCard){
+                var title=instCard.querySelector(".hz-inst-title");
+                if(title) title.style.display="";
+                var content=instCard.querySelector("#hz-instructions-content")||instCard;
+                var instrList=content.querySelector("ol.payment-instructions");
+                if(instrList) instrList.style.display="";
+                if(!document.getElementById("pp-phone-wait-area")){
+                    content.insertAdjacentHTML("beforeend",'.$waitAreaJs.');
+                }
             }
             bindEvents();
             try{sessionStorage.setItem(sessionKey,phone);}catch(e){}
@@ -812,7 +786,7 @@ function pp_phone_render_form($data) {
                 clearInterval(pollTimer);clearInterval(countdownTimer);
                 var fd=new FormData();fd.append("action-v2","pp-phone-verify");
                 fd.append("gateway_id",gatewayId);fd.append("transaction_id",txnRef);
-                fd.append("provider",provider);fd.append("trxid",trxid);fd.append("verify_mode","trxid");
+                fd.append("trxid",trxid);fd.append("verify_mode","trxid");
                 this.innerHTML="Verifying...";
                 var self=this;
                 fetch("",{method:"POST",body:fd}).then(function(r){return r.json();}).then(function(d){
@@ -856,8 +830,7 @@ function pp_phone_render_form($data) {
             if(step2.style.display!=="none" && step1.style.display==="none"){
                 e.preventDefault();
                 goToStep1();
-                /* Push another state so next back does not exit */
-                try{history.pushState({ppStep1:"back"},"");}catch(ex){}
+            }
             }
         });
 
@@ -872,7 +845,7 @@ function pp_phone_render_form($data) {
             pollTimer=setInterval(function(){
                 var fd=new FormData();fd.append("action-v2","pp-phone-poll");
                 fd.append("gateway_id",gatewayId);fd.append("transaction_id",txnRef);
-                fd.append("provider",provider);fd.append("mobile_number",phone);
+                fd.append("mobile_number",phone);
                 fetch("",{method:"POST",body:fd}).then(function(r){return r.json();}).then(function(d){
                     if(d.status==="true"){clearInterval(pollTimer);clearInterval(countdownTimer);
                     try{sessionStorage.removeItem(sessionKey);sessionStorage.removeItem(timeKey);sessionStorage.removeItem(fallbackKey);}catch(e){}
