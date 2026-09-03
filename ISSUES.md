@@ -102,16 +102,15 @@ if ($elapsed > 8) {
 
 ## HIGH — Security
 
-### H1: No CSRF Token on Endpoints
+### H1: No CSRF Token on Endpoints ✅ FIXED
 
 - **File:** `phone-verify.php` (all 3 action handlers)
-- **Scenario:** Any website can forge POST to poll/verify/cancel endpoints if user is authenticated
-- **Impact:** Cross-site request forgery — attacker can cancel/verify transactions from victim's browser
-- **Fix:** Generate CSRF token, validate on every AJAX request
+- **Fix:** `pp_phone_csrf_token()`, `pp_phone_csrf_validate()`, `pp_phone_csrf_rotate()` — CSRF token in FormData for poll/verify/cancel
+- **Status:** Implemented in commit `b21f088`
 
 ---
 
-### H2: XSS in Placeholder
+### H2: XSS in Placeholder ✅ FIXED
 
 - **File:** `phone-verify.php:624`
 - **Scenario:** `$lbl_enter_trxid` comes from `$data['lang']` — not escaped with `htmlspecialchars()`
@@ -129,12 +128,11 @@ if ($elapsed > 8) {
 
 ---
 
-### H4: Transaction Ownership Not Verified
+### H4: Transaction Ownership Not Verified ✅ FIXED
 
 - **File:** `phone-verify.php:82-128`
-- **Scenario:** Any `gateway_id` + `transaction_id` combo accepted — no cross-check if gateway belongs to transaction
-- **Impact:** Wrong gateway config used for amount calculation → false-positive matches
-- **Fix:** After fetching transaction, verify `transaction.gateway_id === provided gateway_id`
+- **Fix:** H4 implemented — validates `transaction.gateway_id === provided gateway_id`
+- **Status:** Implemented in commit `b3c4e6c`
 
 ---
 
@@ -166,31 +164,19 @@ if ($elapsed > 8) {
 
 ---
 
-### L2: Null Dereference on Failed Trxid Match
+### L2: Null Dereference on Failed Trxid Match ✅ FIXED
 
 - **File:** `phone-verify.php:481-486`
-- **Scenario:** Trxid atomic claim succeeds but re-SELECT returns empty → `$matched_sms['id']` accessed on null → PHP warning/error
-- **Impact:** PHP error thrown instead of clean failure response
-- **Fix:** Add null check before accessing `$matched_sms['id']`
-
-```php
-// BEFORE:
-$revertStmt->execute([':approved' => 'approved', ':sms_id' => $matched_sms['id']]);
-
-// AFTER:
-if ($matched_sms) {
-    $revertStmt->execute([':approved' => 'approved', ':sms_id' => $matched_sms['id']]);
-}
-```
+- **Fix:** Null check added before accessing `$matched_sms['id']`
+- **Status:** Implemented in commit `7f34abd`
 
 ---
 
-### L3: Inconsistent Phone Validation
+### L3: Inconsistent Phone Validation ✅ FIXED
 
 - **File:** `phone-verify.php:98` (poll) vs `phone-verify.php:319` (verify)
-- **Scenario:** Poll normalizes only — no format check. Verify validates `^01[3-9]\d{8}$`. Malformed numbers reach poll DB path.
-- **Impact:** Invalid numbers processed on every 3-second poll tick
-- **Fix:** Add same `preg_match` validation in `pp_phone_handle_poll()`
+- **Fix:** Phone validation added to `pp_phone_handle_poll()`
+- **Status:** Implemented in commit `7f34abd`
 
 ---
 
@@ -265,11 +251,12 @@ if ($matched_sms) {
 
 ---
 
-### M4: MODE 1 Query — No Amount Filter
+### M4: MODE 1 Query — No Amount Filter ⚠️ PARTIAL FIX
 
 - **File:** `phone-verify.php:419-427`
 - **Scenario:** Fetches all approved SMS for sender_key (LIMIT 20), filters by phone+tolerance in PHP — wasteful on high-volume gateways
-- **Fix:** Add rough amount range in query to reduce result set
+- **Fix:** Composite index added to SQL file (`idx_sms_data_verify`) — covers sender_key, amount, status, created_date. PHP-side tolerance filter remains.
+- **Status:** Index added in commit `384634b`
 
 ---
 
@@ -405,32 +392,35 @@ if ($matched_sms) {
 
 ## Summary
 
-| Severity | Count | Description |
-|---|---|---|
-| CRITICAL | 7 | Exploits, fraud, data integrity |
-| HIGH | 14 | Security (6) + Logic bugs (8) |
-| MEDIUM | 6 | Code duplication |
-| LOW | 14 | Polish, dead code |
-| **TOTAL** | **41** | |
+| Severity | Total | Fixed | Remaining |
+|---|---|---|---|
+| CRITICAL | 7 | 7 | 0 |
+| HIGH | 14 | 4 | 10 |
+| MEDIUM | 6 | 1 | 5 |
+| LOW | 14 | 0 | 14 |
+| **TOTAL** | **41** | **12** | **29** |
 
 ---
 
 ## Fix Priority
 
 ```
-Round 1 — CRITICAL (1-2 hours):
-  C1-C7
+Round 1 — CRITICAL (DONE):
+  C1-C7 ✅
 
-Round 2 — HIGH Security (1 hour):
-  H1-H6
+Round 2 — HIGH Security (DONE):
+  H1 ✅, H4 ✅, H2 ✅, L2 ✅, L3 ✅
 
-Round 3 — HIGH Logic (30 mins):
-  L1 (by design), L2-L8
+Round 3 — HIGH Security (DONE):
+  H3 time window ✅ (hardcoded 24h), F3 webhook retry ✅, F4 session tracking ✅
 
-Round 4 — MEDIUM (1 hour):
-  M1-M6
+Round 4 — HIGH Logic (Remaining):
+  L4-L8, H3 rate limiting (not yet)
 
-Round 5 — LOW (30 mins):
+Round 5 — MEDIUM (Remaining):
+  M1-M6 (M4 partial — index added)
+
+Round 6 — LOW (Remaining):
   P1-P14
 ```
 
@@ -439,5 +429,6 @@ Round 5 — LOW (30 mins):
 ## Notes
 
 - **L1 (Poll Exact Amount):** By design. Tolerance matching available via manual Transaction ID fallback. Auto-polling intentionally uses exact match.
-- **pv-feature advantages over profess0rpay:** Atomic claim (no race condition), parameterized queries (no SQL injection), masked number support, dedicated file (not inline), admin UI dropdown.
-- **profess0rpay advantages over pv-feature:** `sms_data_validity` time window, pending fallback state, branded UI with QR modal.
+- **pv-feature advantages over profess0rpay:** Atomic claim (no race condition), parameterized queries (no SQL injection), masked number support, dedicated file (not inline), admin UI dropdown, CSRF protection, session tracking, webhook retry, 24h time window.
+- **profess0rpay advantages over pv-feature:** Pending fallback state, branded UI with QR modal.
+- **sms_data index:** Added `idx_sms_data_verify` to SQL file — covers poll + verify query patterns.
