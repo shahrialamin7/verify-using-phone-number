@@ -359,12 +359,13 @@ function pp_phone_handle_poll($data = null) {
 
     $pdo = connectDatabase();
 
-    // Search sms_data: provider + phone + exact amount + approved
+    // Search sms_data: provider + phone + exact amount + approved (within 24h)
     $findSql = 'SELECT id, trx_id, number, amount, sender, type 
                 FROM '.$db_prefix.'sms_data 
                 WHERE sender_key = :sender_key 
                   AND amount = :amount 
                   AND status = :status 
+                  AND created_date > DATE_SUB(NOW(), INTERVAL 24 HOUR)
                 ORDER BY id DESC 
                 LIMIT 10';
     $findStmt = $pdo->prepare($findSql);
@@ -625,6 +626,7 @@ function pp_phone_handle_verify($data = null) {
                     FROM '.$db_prefix.'sms_data 
                     WHERE sender_key = :sender_key 
                       AND status = :approved 
+                      AND created_date > DATE_SUB(NOW(), INTERVAL 24 HOUR)
                     ORDER BY id DESC 
                     LIMIT 20';
         $findStmt = $pdo->prepare($findSql);
